@@ -1,7 +1,7 @@
 #!/bin/bash
 set -xeuo pipefail
 
-cd ${TMPDIR:-/tmp}
+cd "${TMPDIR:-/tmp}"
 
 shopt -s extglob
 export DEBIAN_FRONTEND=noninteractive
@@ -52,6 +52,10 @@ EOF
 # https://github.com/moby/moby/issues/1297
 echo "resolvconf resolvconf/linkify-resolvconf boolean false" |
     debconf-set-selections
+
+# Work around https://bugs.debian.org/1040925
+apt-get -y --no-install-recommends install \
+    ca-certificates-java
 
 while read -r file; do
     case $file in

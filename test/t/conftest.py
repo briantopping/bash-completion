@@ -132,7 +132,7 @@ def _avahi_hosts(bash: pexpect.spawn) -> List[str]:
 def known_hosts(bash: pexpect.spawn) -> List[str]:
     output = assert_bash_exec(
         bash,
-        '_known_hosts_real ""; '
+        '_comp_compgen_known_hosts ""; '
         r'printf "%s\n" "${COMPREPLY[@]}"; unset -v COMPREPLY',
         want_output=True,
     )
@@ -186,7 +186,6 @@ def partialize(
 
 @pytest.fixture(scope="class")
 def bash(request) -> pexpect.spawn:
-
     logfile: Optional[TextIO] = None
     histfile = None
     tmpdir = None
@@ -268,14 +267,18 @@ def bash(request) -> pexpect.spawn:
             # FIXME: Tests shouldn't depend on dimensions, but it's difficult to
             # expect robustly enough for Bash to wrap lines anywhere (e.g. inside
             # MAGIC_MARK).  Increase window width to reduce wrapping.
-            dimensions=(24, 200),
+            dimensions=(24, 240),
             # TODO? codec_errors="replace",
         )
         bash.expect_exact(PS1)
 
         # Load bashrc and bash_completion
+        bash_completion = os.environ.get(
+            "BASH_COMPLETION_TEST_BASH_COMPLETION",
+            "%s/../bash_completion" % testdir,
+        )
         assert_bash_exec(bash, "source '%s/config/bashrc'" % testdir)
-        assert_bash_exec(bash, "source '%s/../bash_completion'" % testdir)
+        assert_bash_exec(bash, "source '%s'" % bash_completion)
 
         # Use command name from marker if set, or grab from test filename
         cmd = None  # type: Optional[str]
@@ -376,10 +379,10 @@ def is_bash_type(bash: pexpect.spawn, cmd: Optional[str]) -> bool:
 
 def load_completion_for(bash: pexpect.spawn, cmd: str) -> bool:
     try:
-        # Allow __load_completion to fail so we can test completions
+        # Allow _comp_load to fail so we can test completions
         # that are directly loaded in bash_completion without a separate file.
-        assert_bash_exec(bash, "__load_completion %s || :" % cmd)
-        assert_bash_exec(bash, "complete -p %s &>/dev/null" % cmd)
+        assert_bash_exec(bash, "_comp_load -- %s || :" % cmd)
+        assert_bash_exec(bash, "complete -p -- %s &>/dev/null" % cmd)
     except AssertionError:
         return False
     return True
@@ -423,20 +426,22 @@ def assert_bash_exec(
     )
     if want_output is not None:
         if output:
-            assert (
-                want_output
-            ), 'Unexpected output from "%s": exit status=%s, output="%s"' % (
-                cmd,
-                status,
-                output,
+            assert want_output, (
+                'Unexpected output from "%s": exit status=%s, output="%s"'
+                % (
+                    cmd,
+                    status,
+                    output,
+                )
             )
         else:
-            assert (
-                not want_output
-            ), 'Expected output from "%s": exit status=%s, output="%s"' % (
-                cmd,
-                status,
-                output,
+            assert not want_output, (
+                'Expected output from "%s": exit status=%s, output="%s"'
+                % (
+                    cmd,
+                    status,
+                    output,
+                )
             )
 
     return output
@@ -596,9 +601,9 @@ class bash_env_saved:
 
     def _unprotect_variable(self, varname: str):
         if varname not in self.saved_variables:
-            self.saved_variables[
-                varname
-            ] = bash_env_saved.saved_state.ChangesDetected
+            self.saved_variables[varname] = (
+                bash_env_saved.saved_state.ChangesDetected
+            )
             self._copy_variable(
                 varname, "%s_OLDVAR_%s" % (self.prefix, varname)
             )
@@ -690,9 +695,9 @@ class bash_env_saved:
 
     def save_variable(self, varname: str):
         self._unprotect_variable(varname)
-        self.saved_variables[
-            varname
-        ] = bash_env_saved.saved_state.ChangesIgnored
+        self.saved_variables[varname] = (
+            bash_env_saved.saved_state.ChangesIgnored
+        )
 
     # TODO: We may restore the "export" attribute as well though it is
     #   not currently tested in "diff_env"
@@ -817,7 +822,6 @@ def assert_complete(
             pytest.xfail(xfail)
 
     with bash_env_saved(bash, sendintr=True) as bash_env:
-
         cwd = kwargs.get("cwd")
         if cwd:
             bash_env.chdir(str(cwd))
@@ -828,33 +832,50 @@ def assert_complete(
         for k, v in kwargs.get("shopt", {}).items():
             bash_env.shopt(k, v)
 
-        bash.send(cmd + "\t")
+        input_cmd = cmd
+        rendered_cmd = kwargs.get("rendered_cmd", cmd)
+        re_MAGIC_MARK = re.escape(MAGIC_MARK)
+
+        trail = kwargs.get("trail")
+        if trail:
+            # \002 = ^B = cursor left
+            input_cmd += trail + "\002" * len(trail)
+            rendered_cmd += trail + "\b" * len(trail)
+
+            # After reading the results, something weird happens. For most test
+            # setups, as expected (pun intended!), MAGIC_MARK follows as
+            # is. But for some others (e.g. CentOS 6, Ubuntu 14 test
+            # containers), we get MAGIC_MARK one character a time, followed
+            # each time by trail and the corresponding number of \b's. Don't
+            # know why, but accept it until/if someone finds out.  Or just be
+            # fine with it indefinitely, the visible and practical end result
+            # on a terminal is the same anyway.
+            maybe_trail = "(%s%s)?" % (re.escape(trail), "\b" * len(trail))
+            re_MAGIC_MARK = "".join(
+                re.escape(x) + maybe_trail for x in MAGIC_MARK
+            )
+
+        bash.send(input_cmd + "\t")
         # Sleep a bit if requested, to avoid `.*` matching too early
         time.sleep(kwargs.get("sleep_after_tab", 0))
-        rendered_cmd = kwargs.get("rendered_cmd", cmd)
         bash.expect_exact(rendered_cmd)
         bash.send(MAGIC_MARK)
         got = bash.expect(
             [
                 # 0: multiple lines, result in .before
-                r"\r\n"
-                + re.escape(PS1 + rendered_cmd)
-                + ".*"
-                + re.escape(MAGIC_MARK),
+                r"\r\n" + re.escape(PS1 + rendered_cmd) + ".*" + re_MAGIC_MARK,
                 # 1: no completion
-                r"^" + re.escape(MAGIC_MARK),
+                r"^" + re_MAGIC_MARK,
                 # 2: on same line, result in .match
-                r"^([^\r]+)%s$" % re.escape(MAGIC_MARK),
+                r"^([^\r]+)%s$" % re_MAGIC_MARK,
                 # 3: error messages
-                r"^([^\r].*)%s$" % re.escape(MAGIC_MARK),
+                r"^([^\r].*)%s$" % re_MAGIC_MARK,
                 pexpect.EOF,
                 pexpect.TIMEOUT,
             ]
         )
         if got == 0:
-            output = bash.before
-            if output.endswith(MAGIC_MARK):
-                output = bash.before[: -len(MAGIC_MARK)]
+            output = re.sub(re_MAGIC_MARK + "$", "", bash.before)
             return CompletionResult(output)
         elif got == 2:
             output = bash.match.group(1)
@@ -891,58 +912,7 @@ def completion(request, bash: pexpect.spawn) -> CompletionResult:
     if marker.kwargs.get("require_cmd") and not is_bash_type(bash, cmd):
         pytest.skip("Command not found")
 
-    if "trail" in marker.kwargs:
-        return assert_complete_at_point(
-            bash, cmd=marker.args[0], trail=marker.kwargs["trail"]
-        )
-
     return assert_complete(bash, marker.args[0], **marker.kwargs)
-
-
-def assert_complete_at_point(
-    bash: pexpect.spawn, cmd: str, trail: str
-) -> CompletionResult:
-    # TODO: merge to assert_complete
-    fullcmd = "%s%s%s" % (
-        cmd,
-        trail,
-        "\002" * len(trail),
-    )  # \002 = ^B = cursor left
-    bash.send(fullcmd + "\t")
-    bash.send(MAGIC_MARK)
-    bash.expect_exact(fullcmd.replace("\002", "\b"))
-
-    got = bash.expect_exact(
-        [
-            # 0: multiple lines, result in .before
-            PS1 + fullcmd.replace("\002", "\b"),
-            # 1: no completion
-            MAGIC_MARK,
-            pexpect.EOF,
-            pexpect.TIMEOUT,
-        ]
-    )
-    if got == 0:
-        output = bash.before
-        result = CompletionResult(output)
-
-        # At this point, something weird happens. For most test setups, as
-        # expected (pun intended!), MAGIC_MARK follows as is. But for some
-        # others (e.g. CentOS 6, Ubuntu 14 test containers), we get MAGIC_MARK
-        # one character a time, followed each time by trail and the corresponding
-        # number of \b's. Don't know why, but accept it until/if someone finds out.
-        # Or just be fine with it indefinitely, the visible and practical end
-        # result on a terminal is the same anyway.
-        repeat = "(%s%s)?" % (re.escape(trail), "\b" * len(trail))
-        fullexpected = "".join(
-            "%s%s" % (re.escape(x), repeat) for x in MAGIC_MARK
-        )
-        bash.expect(fullexpected)
-    else:
-        # TODO: warn about EOF/TIMEOUT?
-        result = CompletionResult()
-
-    return result
 
 
 def in_container() -> bool:
